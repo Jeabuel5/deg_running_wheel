@@ -1,0 +1,421 @@
+---
+title: "Xist_Project"
+author: "Judy Abuel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+PURPOSE: 
+To do DEG analysis on Running Wheel experimental samples of the mice cortex processed for bulk RNA-sequencing. There are 4 genotypes, Male & Female, exposed to different light condition 11:11 and 12:12 Light:Dark. 
+
+# Set working directory & load libraries
+```{r}
+setwd("Users/judyabuel/Desktop/Xist/running_wheel")
+
+library(limma)
+library(edgeR)
+library(dplyr)
+library(tidyverse)
+library(biomaRt)
+library(ggplot2)
+library(ggrepel)
+library(EnhancedVolcano)
+library(tibble)
+
+#install.packages("openxlsx")
+library(openxlsx)
+```
+
+
+# Load raw data & meta data
+```{r}
+counts <- read.delim("GSE297702_clamsrw_rawcounts.txt", row.names = 1)
+metadata <- read.xlsx("rw_metadata.xlsx", sheet = 1)
+
+metadata$Sex <- factor(metadata$Sex)
+metadata$Genotype <- factor(metadata$Genotype)
+metadata$Entrainment <- factor(metadata$Entrainment)
+
+rownames(metadata) <- metadata$Sample
+```
+
+# Create a DEGList and filter
+```{r}
+deg <- DGEList(counts)
+deg <- calcNormFactors(deg, method = "TMM")
+
+keep <- rowSums(cpm(deg) >= 1) >=3
+deg <- deg[keep, , keep.lib.size = FALSE]
+```
+
+Test New Code:
+```{r}
+metadata_v <- metadata[metadata$SampleID %in% colnames(v), ]
+rownames(metadata_v) <- metadata_v$SampleID
+metadata_v <- metadata_v[colnames(v), ]
+
+stopifnot(all(rownames(metadata_v) == colnames(v)))
+
+design <- model.matrix(~ 0 + Sex:Genotype, data = metadata_v)
+colnames(design) <- make.names(colnames(design))
+
+colnames(design)
+```
+
+Voom + model Fit
+```{r}
+# Only keep samples present in both
+deg_v <- deg[, common_samples]
+
+metadata_v <- metadata[metadata$SampleID %in% common_samples, ]
+rownames(metadata_v) <- metadata_v$SampleID
+# Reorder metadata to exactly match deg_v
+metadata_v <- metadata_v[common_samples, ]
+
+# Sanity check
+stopifnot(all(colnames(deg_v) == rownames(metadata_v)))
+
+design <- model.matrix(~ 0 + Sex:Genotype, data = metadata_v)
+colnames(design) <- make.names(colnames(design))
+
+v <- voom(deg_v, design, plot = TRUE)
+fit <- lmFit(v, design)
+```
+
+Create the voom-transformed counts (log2_CPM with weights)
+v$E contains the log2CPM values after voom transformation
+```{r}
+# Voom-transformed counts (log2 CPM with weights)
+voom_log2_CPM <- v$E
+write.csv(voom_log2_CPM, "voom_log2_CPM.csv")
+
+# Simple log2 CPM (no voom weights), for the same samples used in voom
+logCPM <- cpm(deg_v, log = TRUE)
+write.csv(logCPM, "simple_log2CPM.csv")
+
+# Raw CPM for these samples
+write.csv(cpm(deg_v, log = FALSE), "raw_CPM_filtered_samples.csv")
+
+# If you want filtered CPM (after low-expression filtering)
+write.csv(cpm(deg_v, log = FALSE), "filtered_CPM.csv")
+
+```
+
+Define Contrast: Female vs Male across all Genotype
+```{r}
+contrast.matrix <- makeContrasts(
+  Female_vs_Male_HETTG11 = SexFemale.GenotypeHETTG11 - SexMale.GenotypeHETTG11,
+  Female_vs_Male_HETTG12 = SexFemale.GenotypeHETTG12 - SexMale.GenotypeHETTG12,
+  Female_vs_Male_HETWT11 = SexFemale.GenotypeHETWT11 - SexMale.GenotypeHETWT11,
+  Female_vs_Male_HETWT12 = SexFemale.GenotypeHETWT12 - SexMale.GenotypeHETWT12,
+  Female_vs_Male_WTTG11  = SexFemale.GenotypeWTTG11  - SexMale.GenotypeWTTG11,
+  Female_vs_Male_WTTG12  = SexFemale.GenotypeWTTG12  - SexMale.GenotypeWTTG12,
+  Female_vs_Male_WTWT11  = SexFemale.GenotypeWTWT11  - SexMale.GenotypeWTWT11,
+  Female_vs_Male_WTWT12  = SexFemale.GenotypeWTWT12  - SexMale.GenotypeWTWT12,
+  levels = colnames(design)
+)
+
+all(rownames(contrast.matrix) %in% colnames(design))
+
+```
+
+Fitting the Model.
+```{r}
+fit <- lmFit(v, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+topTable(fit2, coef = "Female_vs_Male_HETTG11", number = Inf)
+```
+
+
+**Annotate Genes using the MGI Symbols**
+```{r}
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Install mouse annotation database
+BiocManager::install("org.Mm.eg.db")
+
+library(org.Mm.eg.db)
+
+ensembl_ids <- rownames(deg)
+ensembl_ids_clean <- sub("\\..*", "", ensembl_ids)
+
+annotations <- select(org.Mm.eg.db,
+                      keys = ensembl_ids_clean,
+                      columns = c("SYMBOL", "GENENAME"),
+                      keytype = "ENSEMBL")
+
+top <- topTable(fit2, coef = "Female_vs_Male_HETTG12", number = Inf)
+top$ENSEMBL <- sub("\\..*", "", rownames(top))
+top_annotated <- merge(top, annotations, by.x = "ENSEMBL", by.y = "ENSEMBL", all.x = TRUE)
+```
+
+
+Volcano Plot: Female vs Male across all Genotype
+Annotate genes from the brown4 module including Xist and Snhg14
+```{r}
+# Create output directories
+dir.create("volcano_plots", showWarnings = FALSE)
+dir.create("deg_results", showWarnings = FALSE)
+
+# Initialize list to store DEG results
+all_deg_results <- list()
+
+# Define color scheme
+deg_colors <- c("Upregulated" = "#E41A1C",  # Red
+                "Downregulated" = "#377EB8", # Blue
+                "Not Significant" = "grey80") # Light grey
+
+# Define genes of interest to highlight
+genes_of_interest <- c("Malat1", "Neat1", "Xist", "Meg3", "Rnpc3",
+                      "Kcnq1ot1", "Snhg11", "Leng8", "Ftx", "Gm3764",
+                       "Snhg14", "Sec14l5", "Pnisr", "Miat", "Tia1",
+                      "Mir124a-1hg", "Mir100hg", "A330076H08Rik",
+                      "Al480526", "C130023A14Rik", "Gm37899",
+                      "B830012L14Rik", "4632427E13Rik", "Spaca6",
+                      "A330023F24Rik")
+
+# Loop over all contrasts
+for (contrast_name in colnames(contrast.matrix)) {
+  tryCatch({
+    message("\nProcessing ", contrast_name, "...")
+    
+    # Get DEG results
+    top_table <- topTable(fit2, coef = contrast_name, number = Inf,
+                          sort.by = "P", adjust.method = "BH")
+    
+    if (nrow(top_table) == 0) {
+      warning("No DEGs for contrast: ", contrast_name)
+      next
+    }
+    
+    # Clean Ensembl IDs
+    top_table$ensembl_gene_id <- sub("\\..*", "", rownames(top_table))
+    
+    # Annotate genes using org.Mm.eg.db
+    top_table_annotated <- merge(top_table, annotations, 
+                                 by.x = "ensembl_gene_id", by.y = "ENSEMBL",
+                                 all.x = TRUE) %>%
+      tibble::as_tibble()
+    
+    # Create labels and expression categories
+    top_table_annotated <- top_table_annotated %>%
+      dplyr::mutate(
+        label = dplyr::coalesce(SYMBOL, ensembl_gene_id),
+        Expression = dplyr::case_when(
+          adj.P.Val < 0.05 & logFC > 1  ~ "Upregulated",
+          adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+          TRUE ~ "Not Significant"
+        )
+      )
+    
+    # Store annotated results
+    all_deg_results[[contrast_name]] <- top_table_annotated
+    
+    # Highlight genes of interest
+    highlight_genes <- top_table_annotated %>%
+      dplyr::filter(label %in% genes_of_interest)
+    
+    # Volcano plot
+    volcano_plot <- ggplot(top_table_annotated, 
+                           aes(x = logFC, y = -log10(adj.P.Val),
+                               color = Expression)) +
+      geom_point(size = 1.8, alpha = 0.6) +
+      scale_color_manual(values = deg_colors) +
+      geom_vline(xintercept = c(-1, 1), linetype = "dashed", linewidth = 0.3) +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.3) +
+      labs(
+        title = paste("Volcano plot:", contrast_name),
+        x = expression(Log[2]~"Fold Change (Female/Male)"),
+        y = expression(-Log[10]~"Adjusted P-value"),
+        color = "Expression"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        legend.position = "bottom",
+        plot.title = element_text(face = "bold", hjust = 0.5)
+      ) +
+      geom_text_repel(
+        data = highlight_genes,
+        aes(label = label),
+        color = "black",
+        size = 3,
+        max.overlaps = 30,
+        box.padding = 0.4,
+        force = 1,
+        show.legend = FALSE
+      )
+    
+    # Save plot
+    plot_file <- paste0("volcano_plots/", make.names(contrast_name), ".pdf")
+    ggsave(plot_file, volcano_plot, width = 9, height = 7)
+    
+    message("Saved volcano plot for ", contrast_name)
+    
+  }, error = function(e) {
+    message("Error processing ", contrast_name, ": ", e$message)
+  })
+}
+
+```
+
+Venn Diagram: To see whether there's any overlapping genes in Female vs Male Up regulated Genes
+```{r}
+if (!requireNamespace("VennDiagram", quietly = TRUE)) {
+  install.packages("VennDiagram")
+}
+library(VennDiagram)
+
+# Create output folder
+dir.create("venn_plots", showWarnings = FALSE)
+
+# Loop over each contrast
+for(contrast_name in names(all_deg_results)) {
+  
+  deg_table <- all_deg_results[[contrast_name]]
+  
+  # Define Female-up and Male-up DEGs based on logFC and adj.P.Val
+  # Since logFC is Female vs Male: logFC > 1 → higher in Female, logFC < -1 → higher in Male
+  female_genes <- deg_table %>%
+    filter(adj.P.Val < 0.05 & logFC > 1) %>%
+    pull(label)
+  
+  male_genes <- deg_table %>%
+    filter(adj.P.Val < 0.05 & logFC < -1) %>%
+    pull(label)
+  
+  # Skip if both sets are empty
+  if(length(female_genes) == 0 & length(male_genes) == 0) {
+    message("No significant DEGs for contrast: ", contrast_name)
+    next
+  }
+  
+  # Create Venn diagram
+  venn_file <- paste0("venn_plots/Venn_", make.names(contrast_name), ".pdf")
+  pdf(venn_file, width = 6, height = 6)
+  
+  draw.pairwise.venn(
+    area1 = length(female_genes),
+    area2 = length(male_genes),
+    cross.area = length(intersect(female_genes, male_genes)),
+    category = c("Female_DEGs", "Male_DEGs"),
+    fill = c("#E41A1C", "#377EB8"),
+    alpha = 0.5,
+    cex = 1.5,
+    cat.cex = 1.5,
+    cat.pos = c(-20, 20),
+    cat.dist = 0.05,
+    main = paste("Overlap DEGs -", contrast_name)
+  )
+  
+  dev.off()
+  
+  message("Saved Venn diagram for ", contrast_name)
+}
+
+```
+
+Visualize expression pattern across all samples using voom-transformed log2 CPM values (voom_log2_CPM) using Heatmap.
+```{r}
+library(pheatmap)
+library(dplyr)
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("org.Mm.eg.db")
+
+library(org.Mm.eg.db)
+library(dplyr)
+
+# Get all valid Ensembl keys
+ensembl_keys <- keys(org.Mm.eg.db, keytype = "ENSEMBL")
+
+# Create mapping table
+gene_map <- select(org.Mm.eg.db,
+                   keys = ensembl_keys,
+                   columns = c("ENSEMBL", "SYMBOL"),
+                   keytype = "ENSEMBL") %>%
+  distinct(ENSEMBL, SYMBOL)
+
+# Check the first few rows
+head(gene_map)
+
+# Your genes of interest
+genes_of_interest <- c("Malat1", "Neat1", "Xist", "Meg3", "Rnpc3",
+                       "Kcnq1ot1", "Snhg11", "Leng8", "Ftx", "Gm3764",
+                       "Snhg14", "Sec14l5", "Pnisr", "Miat", "Tia1",
+                       "Mir124a-1hg", "Mir100hg", "A330076H08Rik",
+                       "Al480526", "C130023A14Rik", "Gm37899",
+                       "B830012L14Rik", "4632427E13Rik", "Spaca6",
+                       "A330023F24Rik")
+
+genes_to_plot <- gene_map$ENSEMBL[gene_map$SYMBOL %in% genes_of_interest]
+
+# Keep only those actually in voom matrix
+genes_to_plot <- genes_to_plot[genes_to_plot %in% rownames(voom_log2_CPM)]
+
+# Subset voom matrix
+expr_subset <- voom_log2_CPM[genes_to_plot, ]
+
+# Replace rownames with gene symbols for heatmap readability
+rownames(expr_subset) <- gene_map$SYMBOL[match(rownames(expr_subset), gene_map$ENSEMBL)]
+
+# Check found genes
+print(rownames(expr_subset))
+
+metadata_subset <- metadata[metadata$SampleID %in% colnames(expr_subset), ]
+rownames(metadata_subset) <- metadata_subset$SampleID
+annotation_col <- metadata_subset[, c("Sex", "Genotype")]
+
+
+library(pheatmap)
+library(RColorBrewer)
+
+# Ensure expr_subset has rownames
+if (is.null(rownames(expr_subset))) {
+  stop("expr_subset must have row names (gene IDs or symbols).")
+}
+
+# Subset and prepare metadata
+metadata_subset <- metadata[metadata$SampleID %in% colnames(expr_subset), ]
+rownames(metadata_subset) <- metadata_subset$SampleID
+# Define annotation for columns
+annotation_col <- metadata_subset[, c("Sex", "Genotype")]
+
+# Make sure Sex is a factor
+annotation_col$Sex <- factor(annotation_col$Sex, levels = c("Male", "Female"))
+
+# Define annotation colors
+annotation_colors <- list(
+  Sex = c(Male = "blue", Female = "red"),
+  Genotype = brewer.pal(n = length(unique(annotation_col$Genotype)), name = "Set3")
+)
+
+
+hm <- pheatmap(expr_subset,
+               cluster_rows = TRUE,
+               cluster_cols = TRUE,
+               annotation_col = annotation_col,
+               scale = "row",
+               color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+               fontsize_row = 10,
+               fontsize_col = 10,
+               main = "Expression of Genes in the Brown4 Module")
+
+# Save as PDF
+
+save_pheatmap_pdf <- function(x, filename, width=8, height=10) {
+  pdf(filename, width=width, height=height)   # open PDF device
+  grid::grid.newpage()                        # create new page
+  grid::grid.draw(x$gtable)                   # draw the pheatmap
+  dev.off()                                   # close PDF device
+}
+
+save_pheatmap_pdf(hm, "heatmap_genes_of_b4mod.pdf")
+
+
+```
+
+
